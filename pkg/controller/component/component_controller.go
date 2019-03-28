@@ -8,9 +8,13 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
+	"strconv"
+
+	gitsourcev1alpha1 "github.com/redhat-developer/devopsconsole-operator/pkg/apis/devopsconsole-operator/v1alpha1"
 	componentsv1alpha1 "github.com/redhat-developer/devopsconsole-operator/pkg/apis/devopsconsole/v1alpha1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -19,7 +23,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	"strconv"
 
 	buildv1 "github.com/openshift/api/build/v1"
 	imagev1 "github.com/openshift/api/image/v1"
@@ -137,8 +140,19 @@ func (r *ReconcileComponent) Reconcile(request reconcile.Request) (reconcile.Res
 			return reconcile.Result{}, err
 		}
 
+		// Get gitsource referenced in component
+		gitSource := gitsourcev1alpha1.GitSource{}
+		err = r.client.Get(context.TODO(), client.ObjectKey{
+			Namespace: instance.Namespace,
+			Name:      instance.Spec.Codebase,
+		}, &gitSource)
+		if err != nil {
+			log.Error(err, "Error occured while getting gitsource")
+			return reconcile.Result{}, nil
+		}
+
 		// Create build config with s2i
-		bc := generateBuildConfig(instance.Namespace, instance.Name, ir, instance.Spec.Codebase, "master")
+		bc := r.generateBuildConfig(instance.Namespace, instance.Name, ir, &gitSource)
 		err = r.client.Create(context.TODO(), &bc)
 		if err != nil {
 			log.Error(err, "** BuildConfig creation fails **")
@@ -239,14 +253,37 @@ func getMetaObj(name string, imageNamespace string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{Name: name, Namespace: imageNamespace, Labels: labels}
 }
 
-func generateBuildConfig(namespace string, name string, builder *builderImage, gitURL string, gitRef string) buildv1.BuildConfig {
+func (r *ReconcileComponent) generateBuildConfig(namespace string, name string, builder *builderImage, gitSource *gitsourcev1alpha1.GitSource) buildv1.BuildConfig {
 	buildSource := buildv1.BuildSource{
 		Git: &buildv1.GitBuildSource{
-			URI: gitURL,
-			Ref: gitRef,
+			URI: gitSource.Spec.URL,
+			Ref: gitSource.Spec.Ref,
 		},
 		Type: buildv1.BuildSourceGit,
 	}
+	// Check if secrets provided exist or not
+	if gitSource.Spec.SecretRef != nil && gitSource.Spec.SecretRef.Name != "" {
+		u := unstructured.Unstructured{}
+		u.SetGroupVersionKind(schema.GroupVersionKind{
+			Kind:    "Secret",
+			Version: "v1",
+			Group:   "",
+		})
+
+		err := r.client.Get(context.TODO(), client.ObjectKey{
+			Namespace: namespace,
+			Name:      gitSource.Spec.SecretRef.Name,
+		}, &u)
+		if err != nil {
+			log.Error(err, fmt.Sprintf("Failed to get provided secret please check if secrets %s present or not", gitSource.Spec.SecretRef.Name))
+		} else {
+			// Since error is nil, moving ahead to add secret reference in buildConfig
+			buildSource.SourceSecret = &corev1.LocalObjectReference{
+				Name: gitSource.Spec.SecretRef.Name,
+			}
+		}
+	}
+
 	incremental := true
 
 	return buildv1.BuildConfig{
